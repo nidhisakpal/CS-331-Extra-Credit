@@ -1,33 +1,40 @@
-"""Menu-driven B-tree project for CS 331.
+"""Menu-driven B+ tree project for CS 331.
 
-The program stores student records in a B-tree using id as the primary key.
-It supports loading records from a text file, insertion, deletion, search,
-printing the tree shape, and printing records in sorted id order.
+This version uses a B+ tree, not a regular B-tree.
+
+Important B+ tree idea:
+- Internal nodes store only separator keys used for navigation.
+- Full student records are stored only in the leaf nodes.
+- Leaf nodes are linked together so sorted traversal can scan the leaves from
+  left to right, similar to how database indexes support range scans.
 """
 
 # This import lets type hints refer to classes before Python has finished
-# defining them. That is useful below because BTreeNode stores child BTreeNodes.
+# defining them. That is useful because BPlusTreeNode stores child nodes of its
+# own class.
 from __future__ import annotations
 
-# csv helps correctly parse comma-separated files, including names that might
-# be quoted in a real input file.
+# bisect_left finds where a key belongs inside a sorted list.
+# bisect_right chooses the child pointer in an internal B+ tree node.
+from bisect import bisect_left, bisect_right
+
+# csv correctly parses comma-separated rows, including quoted names if the input
+# file ever contains them.
 import csv
 
-# random is used only for the extra-credit style operations that insert/delete
-# randomly generated students.
+# random is used for the menu options that insert or delete random students.
 import random
 
-# re gives us regular expressions, which make whitespace-separated parsing
-# flexible when the input file is not comma-separated or tab-separated.
+# re gives us regular expressions for flexible whitespace-separated parsing.
 import re
 
-# dataclass automatically creates a simple initializer for StudentRecord.
+# dataclass creates a clean class for one student table row.
 from dataclasses import dataclass
 
-# Path gives a clean, cross-platform way to check and open files.
+# Path is a clear, cross-platform way to work with files.
 from pathlib import Path
 
-# These typing imports make function inputs and return values clearer.
+# These typing imports make function inputs and outputs easier to understand.
 from typing import List, Optional, Tuple
 
 
@@ -35,651 +42,590 @@ from typing import List, Optional, Tuple
 class StudentRecord:
     """A single row in the student table.
 
-    This is the "record" that the B-tree stores as a value. The B-tree key is
-    only the id, but the value attached to that key is the whole StudentRecord.
+    In database language, this is the full table record. The B+ tree uses
+    ``id`` as the search key, but the leaf node stores this complete object.
     """
 
-    # id acts like a database primary key. Each id should be unique.
+    # id is the primary key. Each student id should appear only once.
     id: int
 
-    # studentname stores the student's full name from the input table.
+    # studentname stores the student's full name.
     studentname: str
 
-    # gpa stores the student's numeric grade point average.
+    # gpa stores the student's grade point average.
     gpa: float
 
     def __str__(self) -> str:
-        """Return a nicely formatted table row for printing."""
+        """Return one formatted output row for printing tables."""
 
-        # The formatting pads the id and name columns so output lines up.
+        # The spacing keeps the columns aligned when records are printed.
         return f"{self.id:4d} | {self.studentname:<24} | {self.gpa:.2f}"
 
 
-class BTreeNode:
-    """One node in a B-tree.
+class BPlusTreeNode:
+    """One node in a B+ tree.
 
-    A B-tree node stores keys in sorted order. For this project, each key is a
-    student id, and the matching value is the complete StudentRecord.
+    A leaf node stores real records. An internal node stores separator keys and
+    child pointers only. This is the main difference between this B+ tree and
+    the earlier B-tree version.
     """
 
     def __init__(self, leaf: bool = True) -> None:
-        # leaf tells us whether this node has children. A leaf node is at the
-        # bottom of the tree and contains no child pointers.
+        # leaf tells us whether this node is a bottom-level data node.
         self.leaf = leaf
 
-        # keys contains sorted student ids. These are the values used for
-        # searching, inserting, deleting, and splitting.
+        # In a leaf, keys are student ids for actual records.
+        # In an internal node, keys are separator values used to choose children.
         self.keys: List[int] = []
 
-        # records[i] is the full StudentRecord that belongs to keys[i].
-        # Keeping these lists parallel is what maps each key to a full row.
+        # records is used only for leaf nodes. records[i] belongs to keys[i].
         self.records: List[StudentRecord] = []
 
-        # children contains child nodes. For an internal node with k keys, there
-        # should be k + 1 children. Leaf nodes keep this list empty.
-        self.children: List[BTreeNode] = []
+        # children is used only for internal nodes. If an internal node has k
+        # keys, it should have k + 1 children.
+        self.children: List[BPlusTreeNode] = []
+
+        # next links one leaf to the next leaf. This makes sorted traversal fast
+        # because we can scan the leaf chain without revisiting internal nodes.
+        self.next: Optional[BPlusTreeNode] = None
 
     def __repr__(self) -> str:
-        """Return a debug-friendly version of the node."""
+        """Return a debug-friendly representation of the node."""
 
-        # This is helpful if a node is printed in the Python console.
-        return f"BTreeNode(leaf={self.leaf}, keys={self.keys})"
+        # This helps if a node is printed while debugging.
+        return f"BPlusTreeNode(leaf={self.leaf}, keys={self.keys})"
 
 
-class BTree:
-    """B-tree implementation with configurable minimum degree t.
+class BPlusTree:
+    """B+ tree implementation with configurable minimum degree t.
 
-    For minimum degree t:
-    - Every node except the root has at least t - 1 keys.
-    - Every node can have at most 2t - 1 keys.
-    - A non-leaf node with k keys has k + 1 children.
+    This project uses a simple degree rule similar to the original assignment:
+    - A node can store at most 2t - 1 keys.
+    - A non-root node should store at least t - 1 keys.
+    - Internal-node keys are separators derived from child subtrees.
+    - All full records live in the leaf level.
     """
 
     def __init__(self, t: int = 3) -> None:
-        # The minimum degree must be at least 2. If t were 1, the B-tree rules
-        # would break because nodes could have too few keys to split/merge well.
+        # t must be at least 2 so every split creates valid left/right nodes.
         if t < 2:
             raise ValueError("Minimum degree t must be at least 2.")
 
-        # Save the minimum degree so every operation knows the allowed node size.
+        # Save the minimum degree selected by the user.
         self.t = t
 
-        # The tree starts with one empty leaf node, which is also the root.
-        self.root = BTreeNode(leaf=True)
+        # max_keys is the largest number of keys allowed in one node.
+        self.max_keys = (2 * t) - 1
 
-    def search(self, key: int, node: Optional[BTreeNode] = None) -> Optional[StudentRecord]:
-        """Search for a student id and return its record if found.
+        # min_keys is the smallest number of keys allowed in a non-root node.
+        self.min_keys = t - 1
 
-        The search works like a database index lookup:
-        1. Look inside the current node for the key.
-        2. If it is not here and this is not a leaf, choose the correct child.
-        3. Repeat until the key is found or a leaf proves it is missing.
-        """
+        # A new B+ tree starts as one empty leaf root.
+        self.root = BPlusTreeNode(leaf=True)
 
-        # When the caller does not provide a node, begin at the root. Recursive
-        # calls pass a child node here.
-        if node is None:
-            node = self.root
+    def search(self, key: int) -> Optional[StudentRecord]:
+        """Search for a student id and return the matching record if found."""
 
-        # Find the first key greater than or equal to the search key.
-        # Because node.keys is sorted, all keys before index i are too small.
-        i = 0
-        while i < len(node.keys) and key > node.keys[i]:
-            i += 1
+        # First follow separator keys down to the leaf where this key belongs.
+        leaf, _ = self._find_leaf(key)
 
-        # If the key is present in this node, return the full record.
-        # The record is stored at the same index as the key.
-        if i < len(node.keys) and key == node.keys[i]:
-            return node.records[i]
+        # The leaf keys are sorted, so bisect_left gives the only possible
+        # position where the key could be stored.
+        index = bisect_left(leaf.keys, key)
 
-        # If this is a leaf, the key is not in the tree.
-        # There are no children left to search.
-        if node.leaf:
-            return None
+        # If the position is valid and the id matches, return the full record.
+        if index < len(leaf.keys) and leaf.keys[index] == key:
+            return leaf.records[index]
 
-        # Otherwise, continue searching the child where this key would belong.
-        # Child i contains values between keys[i - 1] and keys[i].
-        return self.search(key, node.children[i])
+        # If the key is not in the leaf, it is not in the B+ tree.
+        return None
 
     def insert(self, record: StudentRecord) -> bool:
-        """Insert a student record.
+        """Insert one student record into the B+ tree.
 
         Returns False if the id already exists, because id is the primary key.
         """
 
-        # A primary key cannot appear twice, so search first to reject duplicate
-        # ids before modifying the tree.
+        # Reject duplicate primary keys before changing the tree.
         if self.search(record.id) is not None:
             return False
 
-        # Keep a short variable for readability because the root is used often.
-        root = self.root
+        # Find the leaf where this record belongs, plus the path of parents.
+        leaf, path = self._find_leaf(record.id)
 
-        # A node is full when it already has the maximum allowed number of keys.
-        # For minimum degree t, the maximum is 2t - 1.
-        if len(root.keys) == (2 * self.t) - 1:
-            # The root is full. B-trees split full nodes before descending so
-            # insertion never has to place a key into an overfull node.
-            new_root = BTreeNode(leaf=False)
+        # Insert the id into the leaf's sorted key list.
+        insert_index = bisect_left(leaf.keys, record.id)
+        leaf.keys.insert(insert_index, record.id)
 
-            # The old root becomes child 0 of the new root.
-            new_root.children.append(root)
+        # Insert the full record at the matching position.
+        leaf.records.insert(insert_index, record)
 
-            # Replace the tree root before splitting so the promoted median key
-            # has a parent to move into.
-            self.root = new_root
-
-            # Split old root. One median key moves into new_root.
-            self._split_child(new_root, 0)
-
-            # Now that the root has room, insert the record normally.
-            self._insert_non_full(new_root, record)
+        # If the leaf overflowed, split it and add a separator to the parent.
+        if len(leaf.keys) > self.max_keys:
+            self._split_leaf(leaf, path)
         else:
-            # If the root is not full, we can insert directly into the normal
-            # recursive helper.
-            self._insert_non_full(root, record)
+            # If the smallest key in this leaf changed, parent separators may
+            # need to be refreshed.
+            self._refresh_path(path)
 
-        # Returning True tells the CLI that the insert succeeded.
+        # Return True so the menu can report success.
         return True
-
-    def _insert_non_full(self, node: BTreeNode, record: StudentRecord) -> None:
-        """Insert into a node that is guaranteed not to be full.
-
-        This helper is the standard B-tree insertion routine. Its important
-        assumption is that the current node has space for one more key.
-        """
-
-        # Start at the rightmost key. We may move left while looking for the
-        # correct sorted position for the new id.
-        i = len(node.keys) - 1
-
-        if node.leaf:
-            # In a leaf, shift larger keys one position right and place the new
-            # record where its id belongs so the keys stay sorted.
-
-            # Add temporary space at the end of both parallel lists.
-            node.keys.append(0)
-            node.records.append(record)
-
-            # Move every larger key/record one slot to the right.
-            while i >= 0 and record.id < node.keys[i]:
-                node.keys[i + 1] = node.keys[i]
-                node.records[i + 1] = node.records[i]
-                i -= 1
-
-            # Insert the new key and matching record into the open slot.
-            node.keys[i + 1] = record.id
-            node.records[i + 1] = record
-            return
-
-        # In an internal node, choose the child that should receive the key.
-        # Move left until we find the first key smaller than the new id.
-        while i >= 0 and record.id < node.keys[i]:
-            i -= 1
-
-        # The child to descend into is one position to the right of that key.
-        i += 1
-
-        # If that child is full, split it first. The median key moves up into
-        # this node, and then we choose which of the two children to descend to.
-        if len(node.children[i].keys) == (2 * self.t) - 1:
-            self._split_child(node, i)
-
-            # After the split, node.keys[i] is the promoted median. If the new
-            # id is larger than that median, it belongs in the new right child.
-            if record.id > node.keys[i]:
-                i += 1
-
-        # Continue recursively until we reach a leaf.
-        self._insert_non_full(node.children[i], record)
-
-    def _split_child(self, parent: BTreeNode, child_index: int) -> None:
-        """Split a full child into two nodes and move its median key up.
-
-        This is the key operation that keeps the B-tree balanced. A full child
-        with 2t - 1 keys becomes two children with t - 1 keys each, while the
-        middle key is promoted into the parent.
-        """
-
-        # Use a local variable because t is used many times in this method.
-        t = self.t
-
-        # The parent owns the child that is too full.
-        full_child = parent.children[child_index]
-
-        # The new child will become the right half of the split node. It has
-        # the same leaf/internal status as the original child.
-        new_child = BTreeNode(leaf=full_child.leaf)
-
-        # The median key is the key at index t - 1. It moves upward into the
-        # parent and separates the left and right halves.
-        median_key = full_child.keys[t - 1]
-        median_record = full_child.records[t - 1]
-
-        # Keys after the median move into the new right child.
-        new_child.keys = full_child.keys[t:]
-        new_child.records = full_child.records[t:]
-
-        # Keys before the median remain in the original left child.
-        full_child.keys = full_child.keys[: t - 1]
-        full_child.records = full_child.records[: t - 1]
-
-        # If the full child was internal, its children must also be split.
-        # The first t children stay on the left; the remaining children move
-        # to the new right child.
-        if not full_child.leaf:
-            new_child.children = full_child.children[t:]
-            full_child.children = full_child.children[:t]
-
-        # Insert the median key/record into the parent at the position where
-        # the old child used to sit.
-        parent.keys.insert(child_index, median_key)
-        parent.records.insert(child_index, median_record)
-
-        # The new right child goes immediately after the original child.
-        parent.children.insert(child_index + 1, new_child)
 
     def delete(self, key: int) -> bool:
-        """Delete a record by id. Returns True if a record was removed."""
+        """Delete a student by id. Returns True if a record was removed."""
 
-        # Search first so the public method can clearly report whether anything
-        # was actually deleted.
-        if self.search(key) is None:
+        # Find the leaf where this id should be stored.
+        leaf, path = self._find_leaf(key)
+
+        # Locate the id inside the leaf.
+        index = bisect_left(leaf.keys, key)
+
+        # If the id is not present, no deletion occurs.
+        if index >= len(leaf.keys) or leaf.keys[index] != key:
             return False
 
-        # Run the recursive B-tree deletion algorithm starting at the root.
-        self._delete(self.root, key)
+        # Remove both the key and the full record from the leaf.
+        leaf.keys.pop(index)
+        leaf.records.pop(index)
 
-        # If the root lost its last key and has a child, shorten the tree.
-        # This can happen after merges near the top of the tree.
-        if len(self.root.keys) == 0 and not self.root.leaf:
-            self.root = self.root.children[0]
+        # If the root is also a leaf, it is allowed to become empty.
+        if leaf is self.root:
+            return True
 
-        # The key existed and was removed.
+        # If the leaf still has enough keys, only separators may need updating.
+        if len(leaf.keys) >= self.min_keys:
+            self._refresh_path(path)
+        else:
+            # Otherwise, fix the underflow by borrowing or merging.
+            self._rebalance_after_delete(leaf, path)
+
+        # A record was successfully removed.
         return True
-
-    def _delete(self, node: BTreeNode, key: int) -> None:
-        """Delete a key from the subtree rooted at node.
-
-        The deletion algorithm keeps every node we descend into at or above the
-        minimum key count when possible. That prevents underflow after deleting.
-        """
-
-        # idx is the first position where key could appear in this node.
-        idx = self._find_key_index(node, key)
-
-        # Case 1: the key is stored in this node.
-        if idx < len(node.keys) and node.keys[idx] == key:
-            if node.leaf:
-                # If the node is a leaf, deletion is simple: remove the key
-                # and its matching record from the parallel lists.
-                self._remove_from_leaf(node, idx)
-            else:
-                # If the node is internal, we cannot simply remove the key
-                # because it separates two child subtrees. Use the standard
-                # predecessor/successor/merge logic instead.
-                self._remove_from_internal(node, idx)
-            return
-
-        # Case 2: the key is not in this node. If this is a leaf, the key is
-        # not in the tree, so there is nothing else to do.
-        if node.leaf:
-            return
-
-        # The key must be in child idx if it exists anywhere below this node.
-        child_index = idx
-
-        # Before descending into a child, make sure it has at least t keys.
-        # This prevents it from dropping below the minimum after deletion.
-        if len(node.children[child_index].keys) < self.t:
-            self._fill_child(node, child_index)
-
-            # Filling may merge the child with a sibling, which can reduce the
-            # number of keys in the parent. If the chosen child moved left,
-            # adjust the child index.
-            if child_index > len(node.keys):
-                child_index -= 1
-
-        # Continue deletion in the corrected child.
-        self._delete(node.children[child_index], key)
-
-    def _find_key_index(self, node: BTreeNode, key: int) -> int:
-        """Return the index of the first key greater than or equal to key."""
-
-        # Start at the leftmost key.
-        idx = 0
-
-        # Move right while keys are still smaller than the target key.
-        while idx < len(node.keys) and node.keys[idx] < key:
-            idx += 1
-
-        # This index is either where the key exists or where it would be.
-        return idx
-
-    def _remove_from_leaf(self, node: BTreeNode, idx: int) -> None:
-        """Remove a key and record directly from a leaf node."""
-
-        # Remove the id from the key list.
-        node.keys.pop(idx)
-
-        # Remove the matching full record from the same index.
-        node.records.pop(idx)
-
-    def _remove_from_internal(self, node: BTreeNode, idx: int) -> None:
-        """Remove a key from an internal node.
-
-        Internal deletion replaces the key with either its predecessor or
-        successor when a neighboring child has enough keys. If both children are
-        minimal, they are merged and deletion continues in the merged child.
-        """
-
-        # Save the key we are trying to remove. If both children merge, this
-        # key will move down into the merged child and then be deleted there.
-        key = node.keys[idx]
-
-        # If the left child has enough keys, replace the current key with its
-        # predecessor: the largest key smaller than it.
-        if len(node.children[idx].keys) >= self.t:
-            pred_key, pred_record = self._get_predecessor(node.children[idx])
-            node.keys[idx] = pred_key
-            node.records[idx] = pred_record
-
-            # The predecessor record has been copied up, so delete its old copy
-            # from the left subtree.
-            self._delete(node.children[idx], pred_key)
-
-        # Otherwise, if the right child has enough keys, replace the current key
-        # with its successor: the smallest key larger than it.
-        elif len(node.children[idx + 1].keys) >= self.t:
-            succ_key, succ_record = self._get_successor(node.children[idx + 1])
-            node.keys[idx] = succ_key
-            node.records[idx] = succ_record
-
-            # Delete the successor from its old location in the right subtree.
-            self._delete(node.children[idx + 1], succ_key)
-
-        # If both children have only the minimum number of keys, merge them with
-        # the key from the parent, then delete from that merged node.
-        else:
-            self._merge_children(node, idx)
-            self._delete(node.children[idx], key)
-
-    def _get_predecessor(self, node: BTreeNode) -> Tuple[int, StudentRecord]:
-        """Return the largest key and record in a subtree."""
-
-        # The predecessor is found by going as far right as possible.
-        current = node
-        while not current.leaf:
-            current = current.children[-1]
-
-        # The largest key in the final leaf is the predecessor.
-        return current.keys[-1], current.records[-1]
-
-    def _get_successor(self, node: BTreeNode) -> Tuple[int, StudentRecord]:
-        """Return the smallest key and record in a subtree."""
-
-        # The successor is found by going as far left as possible.
-        current = node
-        while not current.leaf:
-            current = current.children[0]
-
-        # The smallest key in the final leaf is the successor.
-        return current.keys[0], current.records[0]
-
-    def _fill_child(self, parent: BTreeNode, child_index: int) -> None:
-        """Give a child more keys by borrowing from siblings or by merging.
-
-        This helper is used during deletion. Before deleting from a child, we
-        want that child to have at least t keys if possible. If it has only
-        t - 1 keys, deleting one more could violate the B-tree rules.
-        """
-
-        # First try borrowing from the left sibling. Borrowing is cheaper than
-        # merging because it does not reduce the number of children.
-        if child_index > 0 and len(parent.children[child_index - 1].keys) >= self.t:
-            self._borrow_from_previous(parent, child_index)
-
-        # If the left sibling cannot lend a key, try the right sibling.
-        elif (
-            child_index < len(parent.children) - 1
-            and len(parent.children[child_index + 1].keys) >= self.t
-        ):
-            self._borrow_from_next(parent, child_index)
-
-        # If neither sibling has extra keys, merge the child with one sibling.
-        else:
-            if child_index < len(parent.children) - 1:
-                # Prefer merging with the right sibling when it exists.
-                self._merge_children(parent, child_index)
-            else:
-                # If there is no right sibling, merge with the left sibling.
-                self._merge_children(parent, child_index - 1)
-
-    def _borrow_from_previous(self, parent: BTreeNode, child_index: int) -> None:
-        """Move one key from the left sibling through the parent into a child."""
-
-        # child is the node that needs one more key.
-        child = parent.children[child_index]
-
-        # sibling is the child immediately to the left.
-        sibling = parent.children[child_index - 1]
-
-        # Move the separating parent key down into the front of child.
-        child.keys.insert(0, parent.keys[child_index - 1])
-        child.records.insert(0, parent.records[child_index - 1])
-
-        # If these are internal nodes, the sibling's rightmost child pointer
-        # must also move so child keeps the correct number of children.
-        if not child.leaf:
-            child.children.insert(0, sibling.children.pop())
-
-        # Move the left sibling's largest key up into the parent. This replaces
-        # the separator key that was moved down.
-        parent.keys[child_index - 1] = sibling.keys.pop()
-        parent.records[child_index - 1] = sibling.records.pop()
-
-    def _borrow_from_next(self, parent: BTreeNode, child_index: int) -> None:
-        """Move one key from the right sibling through the parent into a child."""
-
-        # child is the node that needs one more key.
-        child = parent.children[child_index]
-
-        # sibling is the child immediately to the right.
-        sibling = parent.children[child_index + 1]
-
-        # Move the separating parent key down to the end of child.
-        child.keys.append(parent.keys[child_index])
-        child.records.append(parent.records[child_index])
-
-        # If these are internal nodes, the sibling's leftmost child pointer
-        # follows the borrowed separator so child remains structurally valid.
-        if not child.leaf:
-            child.children.append(sibling.children.pop(0))
-
-        # Move the right sibling's smallest key up into the parent.
-        parent.keys[child_index] = sibling.keys.pop(0)
-        parent.records[child_index] = sibling.records.pop(0)
-
-    def _merge_children(self, parent: BTreeNode, child_index: int) -> None:
-        """Merge a child, a parent separator key, and the next child.
-
-        After merging, parent.children[child_index] contains:
-        left child keys + separator key from parent + right sibling keys.
-        """
-
-        # The left child is where all merged keys will end up.
-        child = parent.children[child_index]
-
-        # The right sibling will be absorbed and then removed from parent.
-        sibling = parent.children[child_index + 1]
-
-        # Pull the separator key down from the parent into the left child.
-        child.keys.append(parent.keys.pop(child_index))
-        child.records.append(parent.records.pop(child_index))
-
-        # Append all keys/records from the right sibling.
-        child.keys.extend(sibling.keys)
-        child.records.extend(sibling.records)
-
-        # Internal nodes also need their children moved over.
-        if not child.leaf:
-            child.children.extend(sibling.children)
-
-        # Remove the now-empty sibling pointer from the parent.
-        parent.children.pop(child_index + 1)
 
     def traverse(self) -> List[StudentRecord]:
         """Return all records in sorted order by id."""
 
-        # Accumulate records in this list as the recursive traversal visits
-        # them in sorted key order.
+        # Start at the leftmost leaf, which contains the smallest ids.
+        current = self._leftmost_leaf()
+
+        # Store records as we scan the linked leaf list.
         records: List[StudentRecord] = []
 
-        # Start traversal from the root.
-        self._traverse_node(self.root, records)
+        # Follow leaf.next pointers until there are no more leaves.
+        while current is not None:
+            records.extend(current.records)
+            current = current.next
 
-        # Return the complete sorted list to the caller.
+        # The leaf chain is sorted, so this list is sorted by id.
         return records
 
-    def _traverse_node(self, node: BTreeNode, records: List[StudentRecord]) -> None:
-        """In-order traversal of the B-tree.
-
-        For each key i in a node, the records in child i come before key i.
-        The final child contains keys larger than the last key in the node.
-        """
-
-        # Visit each key/record in order.
-        for i, record in enumerate(node.records):
-            if not node.leaf:
-                # Visit the child containing keys smaller than this record.
-                self._traverse_node(node.children[i], records)
-
-            # Add this node's record after its left child has been visited.
-            records.append(record)
-
-        # After the last key, visit the rightmost child if this is internal.
-        if not node.leaf:
-            self._traverse_node(node.children[-1], records)
-
     def display(self) -> None:
-        """Print the B-tree level by level."""
+        """Print the B+ tree structure level by level."""
 
-        # Start recursive display at the root and label it clearly.
+        # Begin recursive printing at the root.
         self._display_node(self.root, level=0, child_label="root")
 
-    def _display_node(self, node: BTreeNode, level: int, child_label: str) -> None:
-        """Recursive helper for displaying the tree structure."""
+        # Also show the leaf chain because linked leaves are a key B+ tree idea.
+        print("leaf chain:", self._leaf_chain_string())
 
-        # Indentation makes deeper levels appear visually below their parents.
+    def _find_leaf(self, key: int) -> Tuple[BPlusTreeNode, List[Tuple[BPlusTreeNode, int]]]:
+        """Find the leaf where key belongs and return the path to it.
+
+        The path is a list of (parent, child_index) pairs. It is used after
+        insertions and deletions so parent nodes can be updated or rebalanced.
+        """
+
+        # Start every search at the root.
+        current = self.root
+
+        # Store the route taken from the root down to the target leaf.
+        path: List[Tuple[BPlusTreeNode, int]] = []
+
+        # Continue until a leaf node is reached.
+        while not current.leaf:
+            # Internal keys are separator keys. bisect_right chooses the child
+            # whose range should contain the target key.
+            child_index = bisect_right(current.keys, key)
+
+            # Remember this parent and the child position selected.
+            path.append((current, child_index))
+
+            # Descend to the selected child.
+            current = current.children[child_index]
+
+        # current is now the leaf where the key exists or should be inserted.
+        return current, path
+
+    def _split_leaf(self, leaf: BPlusTreeNode, path: List[Tuple[BPlusTreeNode, int]]) -> None:
+        """Split an overfull leaf node into two linked leaves."""
+
+        # The leaf has max_keys + 1 records. Split it roughly in half.
+        split_index = len(leaf.keys) // 2
+
+        # Create a new right leaf.
+        new_leaf = BPlusTreeNode(leaf=True)
+
+        # Move the right half of keys and records into the new leaf.
+        new_leaf.keys = leaf.keys[split_index:]
+        new_leaf.records = leaf.records[split_index:]
+
+        # Keep the left half in the original leaf.
+        leaf.keys = leaf.keys[:split_index]
+        leaf.records = leaf.records[:split_index]
+
+        # Link the new leaf into the leaf chain immediately after the old leaf.
+        new_leaf.next = leaf.next
+        leaf.next = new_leaf
+
+        # The new leaf's first key becomes the separator in the parent.
+        self._insert_child_in_parent(leaf, new_leaf, path)
+
+    def _insert_child_in_parent(
+        self,
+        left_child: BPlusTreeNode,
+        right_child: BPlusTreeNode,
+        path: List[Tuple[BPlusTreeNode, int]],
+    ) -> None:
+        """Insert a newly split right child into the parent node."""
+
+        # If there is no parent, the split happened at the root.
+        if not path:
+            # Create a new internal root with the two split nodes as children.
+            new_root = BPlusTreeNode(leaf=False)
+            new_root.children = [left_child, right_child]
+
+            # Separator keys are always derived from child subtrees.
+            self._refresh_keys(new_root)
+
+            # Replace the old root with the new root.
+            self.root = new_root
+            return
+
+        # Get the parent and the index where left_child is stored.
+        parent, child_index = path.pop()
+
+        # Insert the new right child immediately after the left child.
+        parent.children.insert(child_index + 1, right_child)
+
+        # Recompute separator keys after changing the child list.
+        self._refresh_keys(parent)
+
+        # If the parent overflowed, split it too.
+        if len(parent.keys) > self.max_keys:
+            self._split_internal(parent, path)
+        else:
+            # Otherwise, refresh any ancestors whose separator keys changed.
+            self._refresh_path(path)
+
+    def _split_internal(
+        self,
+        internal: BPlusTreeNode,
+        path: List[Tuple[BPlusTreeNode, int]],
+    ) -> None:
+        """Split an overfull internal node.
+
+        Unlike leaf nodes, internal nodes do not contain records. They contain
+        child pointers and separator keys. After splitting the child pointer
+        list, each internal node recomputes its separator keys from its children.
+        """
+
+        # Split based on children rather than keys because internal keys are
+        # derived from children. If there are 7 children, this gives 3 and 4.
+        split_index = len(internal.children) // 2
+
+        # Create the new right internal node.
+        new_internal = BPlusTreeNode(leaf=False)
+
+        # Move the right half of the child pointers into the new node.
+        new_internal.children = internal.children[split_index:]
+
+        # Keep the left half in the original node.
+        internal.children = internal.children[:split_index]
+
+        # Recompute separator keys for both internal nodes.
+        self._refresh_keys(internal)
+        self._refresh_keys(new_internal)
+
+        # Insert the new right internal node into the parent.
+        self._insert_child_in_parent(internal, new_internal, path)
+
+    def _rebalance_after_delete(
+        self,
+        node: BPlusTreeNode,
+        path: List[Tuple[BPlusTreeNode, int]],
+    ) -> None:
+        """Fix a node that has too few keys after deletion.
+
+        The algorithm first tries to borrow from a sibling. If neither sibling
+        has an extra key, it merges nodes. This is the B+ tree deletion logic
+        that keeps the tree balanced after records are removed.
+        """
+
+        # Continue upward while the current node is not the root and is too small.
+        while node is not self.root and len(node.keys) < self.min_keys:
+            # The path tells us the parent and where node sits among siblings.
+            parent, child_index = path.pop()
+
+            # Identify neighboring siblings if they exist.
+            left_sibling = parent.children[child_index - 1] if child_index > 0 else None
+            right_sibling = (
+                parent.children[child_index + 1]
+                if child_index + 1 < len(parent.children)
+                else None
+            )
+
+            # Try borrowing from the left sibling first.
+            if left_sibling is not None and len(left_sibling.keys) > self.min_keys:
+                self._borrow_from_left(node, left_sibling)
+                self._refresh_keys(parent)
+                self._refresh_path(path)
+                return
+
+            # If the left sibling cannot lend, try the right sibling.
+            if right_sibling is not None and len(right_sibling.keys) > self.min_keys:
+                self._borrow_from_right(node, right_sibling)
+                self._refresh_keys(parent)
+                self._refresh_path(path)
+                return
+
+            # If borrowing is impossible, merge with a sibling.
+            if left_sibling is not None:
+                self._merge_nodes(left_sibling, node)
+                parent.children.pop(child_index)
+                node = parent
+            elif right_sibling is not None:
+                self._merge_nodes(node, right_sibling)
+                parent.children.pop(child_index + 1)
+                node = parent
+
+            # Recompute parent separators after removing a child.
+            self._refresh_keys(parent)
+
+            # If the root has only one child, collapse the height of the tree.
+            if parent is self.root and not parent.leaf and len(parent.children) == 1:
+                self.root = parent.children[0]
+                return
+
+        # If the loop ended because node now has enough keys, refresh ancestors.
+        self._refresh_path(path)
+
+    def _borrow_from_left(self, node: BPlusTreeNode, sibling: BPlusTreeNode) -> None:
+        """Borrow one entry or child pointer from the left sibling."""
+
+        if node.leaf:
+            # For leaves, move the left sibling's largest record to the front
+            # of the underfull node.
+            node.keys.insert(0, sibling.keys.pop())
+            node.records.insert(0, sibling.records.pop())
+        else:
+            # For internal nodes, move the sibling's rightmost child pointer.
+            node.children.insert(0, sibling.children.pop())
+
+            # Separator keys are derived from child pointers, so refresh both.
+            self._refresh_keys(sibling)
+            self._refresh_keys(node)
+
+    def _borrow_from_right(self, node: BPlusTreeNode, sibling: BPlusTreeNode) -> None:
+        """Borrow one entry or child pointer from the right sibling."""
+
+        if node.leaf:
+            # For leaves, move the right sibling's smallest record to the end
+            # of the underfull node.
+            node.keys.append(sibling.keys.pop(0))
+            node.records.append(sibling.records.pop(0))
+        else:
+            # For internal nodes, move the sibling's leftmost child pointer.
+            node.children.append(sibling.children.pop(0))
+
+            # Separator keys are derived from child pointers, so refresh both.
+            self._refresh_keys(sibling)
+            self._refresh_keys(node)
+
+    def _merge_nodes(self, left: BPlusTreeNode, right: BPlusTreeNode) -> None:
+        """Merge right node into left node."""
+
+        if left.leaf:
+            # Leaf merge moves all records from right into left.
+            left.keys.extend(right.keys)
+            left.records.extend(right.records)
+
+            # Preserve the linked leaf chain by skipping over the removed node.
+            left.next = right.next
+        else:
+            # Internal merge moves all child pointers into the left node.
+            left.children.extend(right.children)
+
+            # Recompute separators after changing children.
+            self._refresh_keys(left)
+
+    def _refresh_keys(self, internal: BPlusTreeNode) -> None:
+        """Recompute separator keys for one internal node."""
+
+        # Leaf nodes do not have separator keys to recompute.
+        if internal.leaf:
+            return
+
+        # In this B+ tree, key i stores the smallest key in child i + 1.
+        internal.keys = [self._first_key(child) for child in internal.children[1:]]
+
+    def _refresh_path(self, path: List[Tuple[BPlusTreeNode, int]]) -> None:
+        """Refresh separator keys along a saved root-to-leaf path."""
+
+        # Refresh from the bottom upward because parent separators depend on
+        # child subtrees.
+        for parent, _ in reversed(path):
+            self._refresh_keys(parent)
+
+    def _first_key(self, node: BPlusTreeNode) -> int:
+        """Return the smallest key stored anywhere in a subtree."""
+
+        # Follow the leftmost child until we reach a leaf.
+        current = node
+        while not current.leaf:
+            current = current.children[0]
+
+        # The first key in the leftmost leaf is the subtree's smallest key.
+        return current.keys[0]
+
+    def _leftmost_leaf(self) -> BPlusTreeNode:
+        """Return the leftmost leaf in the B+ tree."""
+
+        # Start at the root.
+        current = self.root
+
+        # Keep following child 0 until the leaf level is reached.
+        while not current.leaf:
+            current = current.children[0]
+
+        # This leaf contains the smallest records in the index.
+        return current
+
+    def _display_node(self, node: BPlusTreeNode, level: int, child_label: str) -> None:
+        """Recursive helper for printing the B+ tree structure."""
+
+        # Indentation makes child levels visually nest under parent levels.
         indent = "    " * level
 
-        # Show only ids in the tree diagram to keep the structure readable.
+        # Label leaves differently so it is clear where actual records live.
+        node_type = "leaf" if node.leaf else "internal"
+
+        # Show the keys stored in this node.
         keys = ", ".join(str(key) for key in node.keys)
+        print(f"{indent}{child_label} ({node_type}): [{keys}]")
 
-        # Print this node's label and its sorted key list.
-        print(f"{indent}{child_label}: [{keys}]")
-
-        # Recursively display children underneath the current node.
+        # Internal nodes recursively print their children.
         if not node.leaf:
             for i, child in enumerate(node.children):
                 self._display_node(child, level + 1, f"child {i}")
 
+    def _leaf_chain_string(self) -> str:
+        """Return a printable version of the linked leaf chain."""
+
+        # Start with the smallest leaf.
+        current = self._leftmost_leaf()
+
+        # Store each leaf's key list as text.
+        parts: List[str] = []
+
+        # Follow the linked leaves from left to right.
+        while current is not None:
+            parts.append("[" + ", ".join(str(key) for key in current.keys) + "]")
+            current = current.next
+
+        # Use arrows to show the links between leaves.
+        return " -> ".join(parts)
+
 
 def parse_student_line(line: str) -> Optional[StudentRecord]:
-    """Parse one row from comma, tab, or whitespace separated text.
+    """Parse one row from comma, tab, or whitespace separated text."""
 
-    The professor's file should be comma-separated, but this function accepts a
-    few common formats so the project is more forgiving.
-    """
-
-    # Remove leading/trailing spaces and newline characters.
+    # Remove leading/trailing spaces and the newline at the end of the row.
     line = line.strip()
 
-    # Ignore blank lines instead of treating them as errors.
+    # Ignore blank lines.
     if not line:
         return None
 
-    # Skip a header row such as "id,studentname,gpa".
+    # Skip the standard CSV header.
     if line.lower().replace(" ", "") in {"id,studentname,gpa", "id\tstudentname\tgpa"}:
         return None
 
-    # Prefer CSV parsing when commas exist because names could be quoted.
+    # Use CSV parsing if the row contains commas.
     if "," in line:
         parts = next(csv.reader([line]))
 
-    # If the row uses tabs, split on tabs.
+    # Use tab splitting if the row contains tabs.
     elif "\t" in line:
         parts = line.split("\t")
 
-    # Otherwise, split on one or more whitespace characters.
+    # Otherwise, split on one or more spaces.
     else:
         parts = re.split(r"\s+", line)
 
-    # Clean up each parsed column and drop accidental empty columns.
+    # Strip whitespace around each field and remove empty fields.
     parts = [part.strip() for part in parts if part.strip()]
 
-    # A valid row must have at least id, name, and gpa.
+    # A valid row needs at least id, name, and gpa.
     if len(parts) < 3:
         raise ValueError(f"Could not parse row: {line}")
 
-    # The first column is the primary key.
+    # Column 1 is the primary key.
     student_id = int(parts[0])
 
     # The last column is GPA.
     gpa = float(parts[-1])
 
-    # Everything between id and gpa is treated as the student's name. This
-    # allows whitespace-separated names like "Emma Johnson".
+    # Everything between id and GPA is the student name.
     name = " ".join(parts[1:-1])
 
-    # Create and return the StudentRecord object used by the B-tree.
+    # Return the row as a StudentRecord object.
     return StudentRecord(student_id, name, gpa)
 
 
 def load_records_from_file(filename: str) -> List[StudentRecord]:
     """Load student records from a text file."""
 
-    # Convert the filename string into a Path object.
+    # Convert the input string to a Path object.
     path = Path(filename)
 
-    # Give a clear error if the file does not exist.
+    # Give a clear error if the file cannot be found.
     if not path.exists():
         raise FileNotFoundError(f"File not found: {filename}")
 
-    # Store every parsed StudentRecord here.
+    # Accumulate parsed records in this list.
     records: List[StudentRecord] = []
 
-    # Open with UTF-8 so normal text files are read consistently.
+    # Open the file as UTF-8 text.
     with path.open("r", encoding="utf-8") as file:
-        # Keep line numbers so parse errors can identify the bad row.
+        # Track line numbers so parse errors are easy to locate.
         for line_number, line in enumerate(file, start=1):
             try:
                 record = parse_student_line(line)
             except ValueError as exc:
-                # Add line number context while preserving the original error.
+                # Add line number context to parsing errors.
                 raise ValueError(f"Line {line_number}: {exc}") from exc
 
-            # parse_student_line returns None for blank lines or headers.
+            # None means the line was blank or a header.
             if record is not None:
                 records.append(record)
 
-    # Return all successfully parsed records.
+    # Return all loaded student rows.
     return records
 
 
 def print_records(records: List[StudentRecord]) -> None:
     """Print records in a simple table."""
 
-    # Avoid printing just the table header when there are no records.
+    # Avoid printing an empty table.
     if not records:
         print("No records to display.")
         return
 
-    # Print a small table header.
+    # Print the table header.
     print("  ID | Student Name             | GPA")
     print("-" * 39)
 
-    # Each StudentRecord controls its own row formatting through __str__.
+    # Print one formatted line per student.
     for record in records:
         print(record)
 
@@ -687,7 +633,7 @@ def print_records(records: List[StudentRecord]) -> None:
 def generate_random_student(existing_ids: set[int]) -> StudentRecord:
     """Generate one random student with an unused id."""
 
-    # First names used to build realistic random student names.
+    # First names for random records.
     first_names = [
         "Avery",
         "Blake",
@@ -706,7 +652,7 @@ def generate_random_student(existing_ids: set[int]) -> StudentRecord:
         "Parker",
     ]
 
-    # Last names used to build realistic random student names.
+    # Last names for random records.
     last_names = [
         "Adams",
         "Bennett",
@@ -725,69 +671,64 @@ def generate_random_student(existing_ids: set[int]) -> StudentRecord:
         "Young",
     ]
 
-    # Choose a random id above the original 1-100 sample range.
+    # Pick an id above the sample file's original 1-100 range.
     new_id = random.randint(101, 999)
 
-    # Keep trying until the id is not already in the tree.
+    # Keep trying until the id is unique.
     while new_id in existing_ids:
         new_id = random.randint(101, 999)
 
-    # Randomly combine one first name and one last name.
+    # Build a random full name.
     name = f"{random.choice(first_names)} {random.choice(last_names)}"
 
-    # Pick a realistic GPA and round it to two decimal places.
+    # Generate a GPA between 2.00 and 4.00.
     gpa = round(random.uniform(2.00, 4.00), 2)
 
-    # Return a complete student record ready for insertion.
+    # Return the complete new record.
     return StudentRecord(new_id, name, gpa)
 
 
-def insert_random_students(tree: BTree, count: int = 5) -> List[StudentRecord]:
+def insert_random_students(tree: BPlusTree, count: int = 5) -> List[StudentRecord]:
     """Insert random students and return the records that were added."""
 
-    # Build a set of ids that already exist so random generation avoids
-    # primary-key duplicates.
+    # Gather existing primary keys so new random records do not duplicate them.
     existing_ids = {record.id for record in tree.traverse()}
 
-    # Track the records inserted so the CLI can display them.
+    # Keep track of inserted records for display.
     added: List[StudentRecord] = []
 
-    # Generate and insert count new records.
+    # Generate and insert the requested number of records.
     for _ in range(count):
         record = generate_random_student(existing_ids)
         tree.insert(record)
-
-        # Update existing_ids immediately so two generated records in the same
-        # batch cannot accidentally share an id.
         existing_ids.add(record.id)
         added.append(record)
 
-    # Return the newly inserted records.
+    # Return the records that were added.
     return added
 
 
-def delete_random_students(tree: BTree, count: int = 20) -> List[int]:
+def delete_random_students(tree: BPlusTree, count: int = 20) -> List[int]:
     """Delete up to count random students from the tree."""
 
-    # Get all current records so we know which ids can be deleted.
+    # Get all current records from the B+ tree leaves.
     records = tree.traverse()
 
     # If the tree is empty, there is nothing to delete.
     if not records:
         return []
 
-    # Extract only the ids because delete works by primary key.
+    # Deletion is by primary key, so extract ids.
     ids = [record.id for record in records]
 
-    # Choose up to count unique ids. min() avoids errors if fewer than count
-    # records are currently stored.
+    # Choose unique ids to delete. min() handles trees with fewer than count rows.
     ids_to_delete = random.sample(ids, min(count, len(ids)))
 
-    # Delete each chosen id from the B-tree.
+    # Delete each selected id.
     for student_id in ids_to_delete:
         tree.delete(student_id)
 
-    # Return deleted ids so the CLI can report exactly what happened.
+    # Return deleted ids so the menu can show what happened.
     return ids_to_delete
 
 
@@ -795,11 +736,10 @@ def prompt_int(message: str) -> Optional[int]:
     """Read an integer from the user. Return None if invalid."""
 
     try:
-        # input() reads text, strip() removes extra spaces, and int() converts
-        # the result into an integer.
+        # input() returns text, strip() removes spaces, and int() converts it.
         return int(input(message).strip())
     except ValueError:
-        # Invalid numeric input should not crash the program.
+        # Invalid input should not crash the CLI.
         print("Please enter a valid integer.")
         return None
 
@@ -808,65 +748,60 @@ def prompt_float(message: str) -> Optional[float]:
     """Read a float from the user. Return None if invalid."""
 
     try:
-        # Convert the user's text input into a floating-point number.
+        # Convert the user's text into a floating-point value.
         return float(input(message).strip())
     except ValueError:
-        # Invalid GPA input should not crash the program.
+        # Invalid input should not crash the CLI.
         print("Please enter a valid number.")
         return None
 
 
-def load_into_tree(tree: BTree, filename: str) -> int:
-    """Load records from a file into an existing B-tree."""
+def load_into_tree(tree: BPlusTree, filename: str) -> int:
+    """Load records from a file into an existing B+ tree."""
 
-    # Parse the file into StudentRecord objects first.
+    # Parse the input file into StudentRecord objects.
     records = load_records_from_file(filename)
 
-    # Count only records that were actually inserted. Duplicate ids are skipped.
+    # Count only records that were inserted. Duplicate ids are skipped.
     inserted = 0
 
-    # Insert each record using the B-tree insert method.
+    # Insert each record using the B+ tree index.
     for record in records:
         if tree.insert(record):
             inserted += 1
 
-    # Return the number of new records added to the tree.
+    # Return how many new records were added.
     return inserted
 
 
 def menu() -> None:
-    """Run the interactive menu.
+    """Run the interactive menu."""
 
-    The menu is intentionally simple so a user can test every required database
-    operation without needing to write any Python code.
-    """
+    # Print a title for the program.
+    print("CS 331 B+ Tree Student Index")
 
-    # Print a title when the program starts.
-    print("CS 331 B-tree Student Index")
+    # Ask for the minimum degree t.
+    degree = prompt_int("Enter minimum degree t for the B+ tree (default 3): ")
 
-    # Ask the user for the B-tree minimum degree. The assignment asks for a
-    # configurable t value, so this lets the user choose it at runtime.
-    degree = prompt_int("Enter minimum degree t for the B-tree (default 3): ")
-
-    # If the user enters invalid text, use the default degree.
+    # Use 3 if the user entered invalid text.
     if degree is None:
         degree = 3
 
     try:
-        # Create the B-tree using the requested minimum degree.
-        tree = BTree(t=degree)
+        # Create the B+ tree using the requested degree.
+        tree = BPlusTree(t=degree)
     except ValueError as exc:
-        # If the degree is too small, explain the issue and recover cleanly.
+        # Recover from invalid degree values such as 0 or 1.
         print(exc)
         print("Using default t = 3.")
-        tree = BTree(t=3)
+        tree = BPlusTree(t=3)
 
-    # Keep showing the menu until the user chooses Exit.
+    # Keep showing the menu until the user exits.
     while True:
-        # Display all operations required by the assignment.
+        # Print all required project operations.
         print("\nMenu")
         print("1. Load data from file")
-        print("2. Display B-tree")
+        print("2. Display B+ tree")
         print("3. Insert a student")
         print("4. Insert 5 random students")
         print("5. Delete a student by id")
@@ -875,43 +810,46 @@ def menu() -> None:
         print("8. Print all records in sorted order")
         print("9. Exit")
 
-        # Read the user's menu choice as text.
+        # Read the user's menu choice.
         choice = input("Choose an option: ").strip()
 
         if choice == "1":
-            # Load records from a text file. Pressing Enter uses students.txt.
+            # Load a file. Pressing Enter uses the sample file.
             filename = input("Enter filename (default students.txt): ").strip() or "students.txt"
             try:
                 inserted = load_into_tree(tree, filename)
-                print(f"Loaded {inserted} new records into the B-tree.")
+                print(f"Loaded {inserted} new records into the B+ tree.")
             except (FileNotFoundError, ValueError) as exc:
-                # File and parsing problems are shown without crashing.
+                # Show file/parsing errors without crashing.
                 print(f"Error: {exc}")
 
         elif choice == "2":
-            # Display the actual B-tree shape, not just sorted records.
-            print("\nB-tree structure:")
+            # Display internal separator nodes, leaves, and the leaf chain.
+            print("\nB+ tree structure:")
             tree.display()
 
         elif choice == "3":
-            # Manually insert one student record.
+            # Insert one user-provided student.
             student_id = prompt_int("Student id: ")
             if student_id is None:
-                # Return to the menu after invalid input.
                 continue
+
+            # Read the student name.
             name = input("Student name: ").strip()
+
+            # Read the GPA.
             gpa = prompt_float("GPA: ")
             if gpa is None:
                 continue
 
-            # Insert the new record. The B-tree rejects duplicate ids.
+            # Insert the record. Duplicate primary keys are rejected.
             if tree.insert(StudentRecord(student_id, name, gpa)):
                 print("Student inserted.")
             else:
                 print("That id already exists. Insert canceled.")
 
         elif choice == "4":
-            # Generate and insert five random students.
+            # Insert five randomly generated students.
             added = insert_random_students(tree, 5)
             print("Inserted these random students:")
             print_records(added)
@@ -921,14 +859,15 @@ def menu() -> None:
             student_id = prompt_int("Student id to delete: ")
             if student_id is None:
                 continue
+
+            # Run B+ tree deletion.
             if tree.delete(student_id):
                 print("Student deleted.")
             else:
                 print("Student id not found.")
 
         elif choice == "6":
-            # Delete twenty random students, or fewer if the tree has less
-            # than twenty records.
+            # Delete twenty random students, or fewer if fewer records exist.
             deleted_ids = delete_random_students(tree, 20)
             if deleted_ids:
                 print(f"Deleted ids: {', '.join(str(item) for item in deleted_ids)}")
@@ -940,6 +879,8 @@ def menu() -> None:
             student_id = prompt_int("Student id to search for: ")
             if student_id is None:
                 continue
+
+            # B+ tree search always descends to a leaf.
             record = tree.search(student_id)
             if record:
                 print("Found:")
@@ -948,21 +889,19 @@ def menu() -> None:
                 print("Student id not found.")
 
         elif choice == "8":
-            # Traversal prints all records sorted by id, which demonstrates the
-            # B-tree's sorted ordering.
+            # Sorted output scans the linked leaf level from left to right.
             print_records(tree.traverse())
 
         elif choice == "9":
-            # End the interactive loop and quit the program.
+            # Exit the menu loop.
             print("Goodbye.")
             break
 
         else:
-            # Handle menu choices outside 1 through 9.
+            # Handle choices outside 1 through 9.
             print("Invalid option. Please choose 1 through 9.")
 
 
 if __name__ == "__main__":
-    # This makes the file executable as a script. The menu will not run if this
-    # file is imported into a separate test script.
+    # Run the menu only when this file is executed directly.
     menu()
