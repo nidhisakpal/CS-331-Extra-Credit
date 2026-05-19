@@ -202,6 +202,39 @@ class BPlusTree:
         # A record was successfully removed.
         return True
 
+    def rebuild_from_records(self, records: List[StudentRecord]) -> int:
+        """Rebuild the whole B+ tree from records sorted by primary key.
+
+        This method is used when loading a table from a file. A database that
+        creates an index from an existing table normally builds the index from
+        sorted keys, not from the accidental physical order of rows in the file.
+        That means the same 100 records should create the same displayed B+
+        tree even if the input file is shuffled.
+
+        Returns the number of unique records placed into the rebuilt tree.
+        """
+
+        # Start over with a fresh empty leaf root.
+        self.root = BPlusTreeNode(leaf=True)
+
+        # Track ids so duplicate primary keys are ignored during rebuilding.
+        seen_ids: set[int] = set()
+
+        # Count the unique records that are actually added.
+        inserted = 0
+
+        # Sort by id first. This makes file loading deterministic and keeps the
+        # resulting B+ tree independent of the input row order.
+        for record in sorted(records, key=lambda item: item.id):
+            if record.id in seen_ids:
+                continue
+            self.insert(record)
+            seen_ids.add(record.id)
+            inserted += 1
+
+        # Return the number of unique records loaded into the new tree.
+        return inserted
+
     def traverse(self) -> List[StudentRecord]:
         """Return all records in sorted order by id."""
 
@@ -762,15 +795,24 @@ def load_into_tree(tree: BPlusTree, filename: str) -> int:
     # Parse the input file into StudentRecord objects.
     records = load_records_from_file(filename)
 
-    # Count only records that were inserted. Duplicate ids are skipped.
+    # Keep all records already in the tree. This lets Load add to an existing
+    # tree while still rebuilding a deterministic sorted index afterward.
+    records_by_id = {record.id: record for record in tree.traverse()}
+
+    # Count only records that are new primary keys. Duplicate ids are skipped.
     inserted = 0
 
-    # Insert each record using the B+ tree index.
+    # Add records from the file by id. The physical file order does not matter
+    # because rebuild_from_records sorts everything before building the index.
     for record in records:
-        if tree.insert(record):
+        if record.id not in records_by_id:
+            records_by_id[record.id] = record
             inserted += 1
 
-    # Return how many new records were added.
+    # Rebuild from sorted ids so shuffled files produce the same B+ tree shape.
+    tree.rebuild_from_records(list(records_by_id.values()))
+
+    # Return how many new records were added from this file.
     return inserted
 
 

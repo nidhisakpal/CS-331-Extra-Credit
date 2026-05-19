@@ -69,6 +69,10 @@ id,studentname,gpa
 
 The parser also tries to handle comma-separated, tab-separated, and whitespace-separated rows.
 
+When loading from a file, the program sorts the records by `id` before building
+the B+ tree. This makes the initial index deterministic: the same set of rows
+creates the same B+ tree even if the input file is shuffled.
+
 ## How to Run
 
 Open a terminal in this project folder and run:
@@ -123,6 +127,11 @@ Found:
 ## B+ Tree Insert
 
 Insertion descends through internal separator keys until it reaches the correct leaf. The new record is inserted into that leaf in sorted order. If the leaf becomes too large, it splits into two leaves, and the first key of the new right leaf becomes a separator in the parent. If the parent overflows, internal nodes split upward as needed.
+
+For the menu option that loads the original table from a file, the records are
+sorted by primary key before insertion. This matches how a database would build
+an index from an existing table and prevents the initial tree display from
+depending on the row order in the text file.
 
 ## B+ Tree Search
 
